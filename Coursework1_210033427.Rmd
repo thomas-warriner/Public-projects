@@ -1,0 +1,589 @@
+---
+title: "MTH6139 Time Series"
+author: "Thomas Warriner"
+date: "Spring term 2025"
+output: github_document
+subtitle: "Carbon emission and mitigation: a look at Meta's 'Prophet' forecaster"
+---
+
+```{r, echo=FALSE}
+# This code will display the QMUL logo at the top right of the page
+# Do not change this code
+htmltools::img(src = knitr::image_uri("images/QMlogo.png"),
+               alt = 'logo',
+               style = 'position:absolute; top:0; right:0; padding:10px; width:20%;')
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# An introduction to the project
+
+My aim for this brief project is to present a data-modelling journey, through both pre-known methods in `R` and with a new tool, Meta's 'Prophet'.
+
+I aim to garner some insights into the package's inbuilt `co2` dataset, and then explore a dataset of my own discovery.
+
+```{r, echo = FALSE}
+##To run this document for yourself you will need to uncomment the below and install the relevant packages.
+
+#install.packages("remotes"); remotes::install_github('facebook/prophet@*release', subdir='R');install.packages("zoo");install.packages("readr")
+library(prophet)
+library(zoo)
+library(readr)
+```
+
+
+# Meta's Prophet
+
+## The co2 dataset
+
+Using R we can pull out some basic information from the co2 dataset inbuilt to `R`. **Note this is not to be confused with the CO2 dataset inbuilt to R which not a time series**
+
+```{r}
+data(co2)
+```
+
+```{r}
+head(co2) ##View the start of the data
+tail(co2)  ##View the end of the data
+summary(co2)  ##View key statistics
+plot(co2,
+     main = "Atmospheric CO2 at
+     the Mauna Loa observatory",
+     xlab = "Year", ylab = "CO2 (pp million)")
+```
+
+We can immediately see an increasing trend, broadly linear but possibly polynomial and perhaps exponential. But what are we actually looking at?
+
+The R documentation for the dataset reveals that this data shows the concentration of CO2 in the air as parts per million as measured between 1959 and 1997 at the Mauna Loa Observatory in Hawai'i.
+
+Intuitively, the yearly trend could be explained by the carbon cycle in plants, with plants photosynthesising in the Summer, reducing CO2. And the overall trend fits with our modern-day understanding of the role human habits are playing in polluting the atmosphere with greenhouse gases, contributing to global warming.
+
+Let us use apply regression to get a greater understanding of the trend.
+
+## Simple analysis
+
+```{r}
+co2.df = data.frame(
+  ds=as.yearmon(time(co2)), 
+  y=co2)
+```
+
+A good first step would be a simple linear regression model
+
+```{r}
+linear_model = lm(y~ds, data = co2.df)
+linear_model$coefficients
+summary(linear_model)
+```
+
+The same graph as above, with this model indicated:
+
+```{r, echo=FALSE}
+plot(co2,
+     main = "Atmospheric CO2 at
+     the Mauna Loa observatory",
+     xlab = "Year", ylab = "CO2 (pp million)")
+points(co2.df$ds, fitted.values(linear_model),
+       type = "l", col = "tomato")
+```
+
+We could also fit a quadratic and exponential models:
+
+```{r}
+quad_model = lm(y~ds+I(ds^2), data = co2.df)
+quad_model$coefficients
+summary(quad_model)
+
+exp_model = lm(log(y)~ds, data = co2.df)
+exp_model$coefficients
+summary(exp_model)
+
+par(mfrow = c(1,3))
+
+plot(co2,
+     main = "Linear",
+     xlab = "Year", ylab = "CO2")
+points(co2.df$ds, fitted.values(linear_model),
+       type = "l", col = "tomato")
+
+plot(co2,
+     main = "Quadratic",
+     xlab = "Year", ylab = "CO2")
+points(co2.df$ds, fitted.values(quad_model),
+       type = "l", col = "turquoise")
+
+plot(co2,
+     main = "Exponential",
+     xlab = "Year", ylab = "CO2")
+points(co2.df$ds, exp(fitted.values(exp_model)),
+       type = "l", col = "gold")
+
+```
+
+We could predict the CO2 levels of CO2 in February 2025 using the quadratic model.
+
+```{r}
+c = quad_model$coefficients[1]
+b = quad_model$coefficients[2]
+a = quad_model$coefficients[3]
+
+Month_now = zoo::as.yearmon("Feb 2025")
+x = as.double(Month_now)
+```
+
+Simply substitute in the values as per a quadratic equation $ax^2 + bx + c$
+
+```{r}
+Feb_prediction = a*x^2 + b*x + c
+Feb_prediction
+```
+
+Comparing this to [the actual figure](https://gml.noaa.gov/ccgg/trends/) of 427.09 yields a shockingly accurate conclusion.
+
+![](images/MaunaLoa_Febactual.png){width="356"}
+
+The error is a tiny 0.69%!
+
+```{r, echo = FALSE}
+z = seq(from = 1960, to  = 2026, length = 1000)
+plot(x = z, y = a*z^2+b*z+c,
+     type  = "l", col = "turquoise",
+     xlab = "Year", ylab = "CO2 prediction",
+     main = "Quadratic model")
+lines(c(1997,1997),c(0,500))
+lines(c(x,x),c(0,Feb_prediction), col  = "tomato")
+lines(c(1960,x),c(Feb_prediction,Feb_prediction), col = "tomato")
+lines(c(1960,x),c(427.09,427.09), col = "gold")
+legend("bottomleft", cex = 0.6,
+       legend = c("Data ends",
+                  "2025 and prediction",
+                  "Actual 2025 value"),
+       col = c("black","tomato","gold"),
+       lty = 1)
+```
+
+## Prophet analysis
+
+### Motivation
+
+The aim of this project was not to show that Meta's prophet is weak in comparison to a quadratic regression model - this definitely is not the case - but the bar is certainly high!
+
+If we decompose the time series, we can clearly see a yearly seasonality which is not captured by our quadratic model.
+
+```{r}
+plot(decompose(co2), cex.lab = 0.55)
+```
+
+Perform a Breusch-Pagan test to check for heteroscedasticity.
+
+```{r}
+lmtest::bptest(co2.df$y~co2.df$ds)
+```
+
+At the 5% significance level we would keep the hypothesis that the error is homoscedastic, but this is borderline and could be studied further.^E1^
+
+### Prophet
+
+The quadratic model seems effective, but is limited to predicting a value which ignores the month's place in the year. Let us explore the options Prophet has for us. I will leave inputs as default for now.
+
+```{r}
+model_prophet = prophet(co2.df)
+future_prophet = make_future_dataframe(model_prophet,
+                                       30*12,
+                                       freq = "month")
+predict_prophet = predict(model_prophet,
+                          future_prophet)
+plot(model_prophet,predict_prophet)
+```
+
+This has produced a model which we can visualise, capturing the yearly trend, and also giving an interval showing decreasing confidence in the model over time.
+
+To play around with fine tuning Prophet, I'll define a function for brevity which collects the above lines in one.
+
+```{r, results = "hide"}
+prophet_process = function(model){
+    myfuture = make_future_dataframe(model,
+                                     30*12,
+                                     freq = "month")
+    mypredict = predict(model, myfuture)
+    plot(model,mypredict)
+}
+```
+
+Let us see what the model looks like if we forget about yearly trend.
+
+```{r, results = "hide"}
+prophet_process(prophet(co2.df, yearly.seasonality = FALSE))
+```
+
+Note not only that not only is the model now predicting without the 'wavy' yearly trend, but its confidence in the predictions has increased, with the cone around the predictions narrowing. I have laboured to explain this, but have not been able to figure this out. My instinct would have been that the same degree of uncertainty is left over after taking away yearly trend from the 'wavy' model: a point for further study later.^Q1^
+
+We could allow Prophet to reduce its certainty from the default value of 0.8 down to 0.5.
+
+```{r, results = "hide"}
+prophet_process(prophet(co2.df, yearly.seasonality = TRUE, interval.width = 0.5))
+```
+
+We could even choose to make estimates via Monte Carlo methods rather than taking precise calculations. This processes much quicker on my computer, but the lower parameters are clearly inaccurate based on our knowledge of the yearly seasonal pattern. 100 however is indistinguishable from the exact case.
+
+```{r, results = "hide"}
+set.seed(0)
+par(mfrow = c(1,3))
+prophet_process(prophet(co2.df, mcmc.samples = 10))
+prophet_process(prophet(co2.df, mcmc.samples = 20))
+prophet_process(prophet(co2.df, mcmc.samples = 100))
+```
+
+The question on your mind, I'm sure, is whether Prophet predicted February 2025 better or worse than the simple quadratic model.
+
+Reminder: the quadratic model predicted 424.1423 pp million. The actual figure was 427.09 pp million, giving a 0.69% error.
+
+Let's see what Prophet predicts.
+
+```{r}
+prophet_Feb2025 = predict_prophet[predict_prophet$ds == "2025-02-01",]$yhat
+prophet_Feb2025
+(427.09-prophet_Feb2025)/427.09
+```
+
+Prophet yields a 5.58% error!
+
+The key here is that despite compensating for seasonality, the prophet forecaster only offers the options for `trend` of linear, logistic, and flat, not quadratic. We will add '*how to create a quadratic model in prophet*' to things to study at a later date.^Q2^
+
+## Best of both worlds
+
+Let us attempt to build a quadratic model taking into account yearly seasonality ourselves.
+
+```{r}
+MaunaLoa_months = co2.df$ds - trunc(as.double(co2.df$ds))
+month_labels = format(as.Date(co2.df$ds), "%B")
+head(month_labels)
+
+combined_model = lcombined_model = lcombined_model = lm(y~ds+I(ds^2)+month_labels, data = co2.df)
+
+plot(co2,
+     main = "Combined model",
+     xlab = "Year", ylab = "CO2")
+points(co2.df$ds, fitted.values(combined_model),
+       type = "l", col = "pink")
+```
+
+What a great fit! Let's use it to predict.
+
+```{r}
+summary(combined_model)
+```
+
+So to predict the CO2 levels we would form the equation $ax^2+bx+c+d$ where d is the added constant for February, -1.875. I would already invalidate this model. As discussed earlier, we expect more CO2 in the atmosphere in the Winter, not less.
+
+```{r}
+d = combined_model$coefficients["month_labelsFebruary"]
+
+new_Feb_prediction = a*x^2 + b*x + c + d
+new_Feb_prediction
+(427.09-new_Feb_prediction)/427.09
+```
+
+Indeed, we are now 1.13% inaccurate.
+
+## Takeaways
+
+From this exercise I have refined my understanding of linear regression in `R` and been introduced to the Prophet forecasting tool. The analysis here presented is helpful both as a guide to such modelling methods in `R` and, perhaps as a proof that the simplest solutions are sometimes the best.
+
+# Santander Bikes
+
+## Motivation
+
+In-keeping with the climate-conscious theme, I will use prophet to look at the lengths of journeys taken by people on Santander bikes. If you are unfamiliar with the scheme, around London there are a number of docking stations into which large, red bicycles can be affixed, see image below. It is important to note that each station has a unique name.
+
+At a reasonable rate, Londoners can hire the bikes (affectionately known as Boris Bikes for the London mayor at the time of introduction) for commuting, leisure, or exercise. I personally have used them for all 3 of these purposes, and find the scheme to be excellent.
+
+![](images/Santander_bikes.jpg)
+
+## The data
+
+TFL releases free data of all journeys taken on the bikes, including the start and end times, and the start and end docking stations. Yes, really! Every individual journey is logged and available to view. The below is a journey I may very well have taken to get to work in April, from the East end suburbs (Furze Green) to an urban district in the city (Finsbury Square).
+
+```{r}
+bikes_example = read.csv("data/Bikes/393JourneyDataExtract01Apr2024-14Apr2024.csv")
+bikes_example[112947,]
+```
+
+To avoid crashing this document, I have parsed the data elsewhere. In a separate R file I collected the different files together, removing irrelevant columns, and filtering for all journeys from Furze Green, the nearest docking station to me. I then take the total sum of milliseconds of journeys for each day of the year and then convert this to minutes. See appendix A for the code.
+
+The data covers 12th September 2022 to 31st December 2024. Earlier data is available but before 12th September 2022, the data is formatted sufficiently differently that the parsing would take too long.^E2^
+
+The data is freely to available to download from [TFL](https://cycling.data.tfl.gov.uk/).
+
+### A first look
+
+Let us read in and plot the data
+
+```{r}
+furze = read_csv("data/Furze.csv")
+furze.df = data.frame(
+  ds=strptime(furze$...1, format = "%Y-%m-%d"), 
+  y=furze$x)
+plot(furze.df)
+```
+
+We have some notable outliers above the majority of the data. These are easily removed. Looking into the relevant files, we see that the problem dates feature some journeys of 30 days or more. We could assume these to be thefts or system errors.^E3^
+
+```{r}
+furze.df = furze.df[furze.df$y < 3000,]
+plot(furze.df, type = "l",
+     xlab = "Date", ylab = "Total minutes",
+     main = "Total minutes rode on Santander bikes from Furze Green")
+```
+
+Or better seen with some smoothing.
+
+```{r}
+plot(furze.df$ds, stats::filter(furze.df$y, rep(1/14,14)),
+     type = "l",
+     xlab = "Date", ylab = "",
+     main = "Filtered across a fortnight")
+```
+
+It would be delightful to compare this to a dataset of daily max temperature in London, but sadly there is not time to do this for this project.^E4^
+
+```{r}
+#plot(decompose(furze), cex.lab = 0.55)
+```
+
+## Trends with Prophet
+
+Let us now pass the data to the Prophet tool and create a prediction for the next year.
+
+```{r}
+prophet_process = function(model){
+    myfuture = make_future_dataframe(model,
+                                     365,
+                                     freq = "day")
+    mypredict = predict(model, myfuture)
+    prophet_plot_components(model, mypredict)
+    plot(model,mypredict)
+}
+
+```
+
+```{r}
+prophet_process(prophet(furze.df))
+```
+
+There is much to glean from this.
+
+There is a clear preference among users for Thursdays, and an overall increase in usage into the summer months, then sharply declining after. The same plot also indicates another unexplained cycle; note the bumps which are roughly monthly: could this be our weather variable? Or perhaps as payday approaches each month, people become less keen to pay for the tube.
+
+And finally, an overall trend is identified of a general increase in usage towards the start of 2024, and then a gradual decline since. I couldn't find evidence to corroborate this, but I do remember a change to the pricing system occurring around this time or bit earlier (the change made journeys under 30 minutes more expensive). If I'm right, TFL really ought to reverse that decision! More likely though, this could be due to competition with other services such as Lime or Forest.^E5^
+
+### Comparison to Finsbury Square
+
+The advantage to this dataset is that I can easily look into processing another set of very similar data. I have created another dataset with the only change being the choice of stating station to the aforementioned Finsbury Square. Naturally, the most prescient difference in the raw data will be time of day, with these bikes all used around 5:30 when office workers go home. But my parsing removed this level of precision.^E6^ But what insight will we get from Prophet?
+
+```{r}
+finsbury = read.csv("data/Finsbury.csv")
+finsbury.df = data.frame(
+  ds=strptime(finsbury[,1], format = "%Y-%m-%d"), 
+  y=finsbury[,2])
+plot(finsbury.df)
+```
+
+Let us be fair and apply the same outlier criterion as before.
+
+```{r}
+finsbury.df = finsbury.df[finsbury.df$y < 3000,]
+plot(finsbury.df, type = "l",
+     xlab = "Date", ylab = "Total minutes",
+     main = "Total minutes rode on Santander bikes
+     from Finsbury Square")
+```
+
+Smooth in the same way as above and add Furze data in red.
+
+```{r}
+plot(finsbury.df$ds, stats::filter(finsbury.df$y, rep(1/14,14)),
+     type = "l",
+     xlab = "Date", ylab = "",
+     ylim = c(100,800))
+lines(x = furze.df$ds,
+      y = stats::filter(furze.df$y, rep(1/14,14)),
+      col = "tomato")
+```
+
+```{r}
+prophet_process(prophet(finsbury.df))
+```
+
+Here we have a clear preference for the weekdays, and while the summer months do see an increase, the difference is less pronounced than at Furze Green; likely as making a homeward journey in the rain is less inconvenient than arriving at work soaked.
+
+Also note the slimmer confidence intervals; the behaviour at this station is much easier to predict than at Furze Green
+
+The most striking difference is the change in overall trend with TFL seeing a linear increase in usage at this station since 2023.
+
+## Predictions
+
+As learned above with the `co2` data, the proof is in the predictions. Let us create datasets of the most recently available data (January 2025) and see if either model hold water.
+
+```{r}
+par(mfrow = c(1,2))
+furze_jan = read.csv("data/Furze_jan.csv")
+furze_jan.df = data.frame(
+  ds=strptime(furze_jan[,1], format = "%Y-%m-%d"), 
+  y=furze_jan[,2])
+
+furze_jan.df = furze_jan.df[furze_jan.df$y < 3000,]
+plot(furze_jan.df[79:109,], type = "l",
+     xlab = "Date", ylab = "Total minutes",
+     main = "Furze Green")
+
+finsbury_jan = read.csv("data/Finsbury_jan.csv")
+finsbury_jan.df = data.frame(
+  ds=strptime(finsbury_jan[,1], format = "%Y-%m-%d"), 
+  y=finsbury_jan[,2])
+
+finsbury_jan.df = finsbury_jan.df[finsbury_jan.df$y < 3000,]
+plot(finsbury_jan.df[79:109,], type = "l",
+     xlab = "Date", ylab = "Total minutes",
+     main = "Finsbury Square")
+```
+
+We can run prophet again and predict only the next month.
+
+```{r}
+## For ease of reading plotting code below, I use single letter variable names.
+## Refer to the earlier use of Prophet for actual understanding of this code chunk.
+
+m = prophet(furze.df)
+f = make_future_dataframe(m,
+            31,
+            freq = "day")
+p = predict(m,f)
+```
+
+We can then extract the predicted values and indicate the confidence interval in blue. Then the actual data is overlaid in red.
+
+```{r}
+plot(p$ds[770:868], p$yhat[770:868], type = "l", ylim = c(-2000,3000),
+     xlab = "Date", ylab = "Minutes",
+     main = "Furze Green Predictions")
+lines(p$ds[770:868], p$yhat_upper[770:868],
+      type = "l", col = "blue")
+lines(p$ds[770:868], p$yhat_lower[770:868],
+      type = "l", col = "blue")
+lines(furze_jan.df, col = "tomato")
+lines(x = c(p$ds[841], p$ds[841]),
+      y = c(-3000,3000),
+      lty = 2)
+```
+
+Not bad. I think it's clear that Furze Green is not all that interesting, as its total minutes can have spikes such as the one shown here on 24th January and the variability this causes makes our predictions not very robust.
+
+Now for Finsbury Square:
+
+```{r}
+m2 = prophet(finsbury.df)
+f2 = make_future_dataframe(m2,
+            31,
+            freq = "day")
+p2 = predict(m2,f2)
+```
+
+```{r}
+plot(p2$ds[770:868], p2$yhat[770:868], type = "l", ylim = c(-200,1000),
+     xlab = "Date", ylab = "Minutes",
+     main = "Finsbury Square Predictions")
+lines(p2$ds[770:868], p2$yhat_upper[770:868],
+      type = "l", col = "blue")
+lines(p2$ds[770:868], p2$yhat_lower[770:868],
+      type = "l", col = "blue")
+lines(finsbury_jan.df, col = "tomato")
+lines(x = c(p2$ds[838], p2$ds[838]),
+      y = c(-3000,3000),
+      lty = 2)
+```
+
+The real values for January sit snugly within the prediction interval!
+
+The caveat to this is that Prophet uses a default confidence level of 0.8 and we might prefer this a bit higher with a wider interval.
+
+In any case, Prophet has certainly redeemed itself as a prediction tool and is certainly something I will consider using in the future.
+
+# Appendices
+
+## Appendix A - data-loading code
+
+The following is the code I used to load in and parse the data for Furze Green, after placing the files in the 'Bikes' folder in 'data'. I have removed these files for ease of transfer but they could be easily downloaded again [here](https://cycling.data.tfl.gov.uk/).
+
+```{r}
+##Iterate over files in directory and only read relevant columns
+
+#library(readr)
+#library(dplyr)
+#library(zoo)
+
+#files = list.files(path = "data/Future", pattern = "\\.csv$", full.names = TRUE)
+#files
+#data = list()
+#for (file in files){
+#    a = read_csv(file, col_types = cols_only(
+#        "Start date" = col_character(),
+#        "Start station" = col_character(),
+#        "Total duration (ms)" = col_double()))
+#    data[[file]] = a
+#}
+
+
+
+##Bind the data together
+#combined_data = bind_rows(data)
+
+#Station = "Furze Green, Bow"
+
+##Filter for station
+#rowsofinterest = combined_data$`Start station` == Station
+#collected_data = combined_data[rowsofinterest,]
+
+##Extract times (and deal with the different formatting around summertime!)
+#b1 = strptime(collected_data$`Start date`, format = "%Y-%m-%d %H:%M")
+#b1 = b1[!is.na(b1)]
+#b2 = strptime(collected_data$`Start date`, format = "%d/%m/%Y %H:%M")
+#b2 = b2[!is.na(b2)]
+#b = c(b1,b2)
+#c =format(b, format = "%d/%m/%Y")
+#collected_data["Date"] = c
+
+##Create the time series
+#x = data.frame(
+#    ds = as.Date(unique(collected_data$Date),
+#                 format = "%d/%m/%Y"))
+#sort(x$ds)
+
+#for (i in 1:length(x$ds)){
+#    date = x$ds[i]
+#    rowsofinterest2 = as.Date(collected_data$Date,
+#                              format = "%d/%m/%Y") == date
+
+#    x[i,"Minutes"] = sum(collected_data$`Total duration (ms)`[rowsofinterest2]*(1/1000)*(1/60),
+#                    na.rm = TRUE)
+#}
+
+#y = read.zoo(x)
+#plot(y)
+#write.csv(y, file = "data/Furze_jan.csv")
+```
+
+## Appendix B - options for further study
+
+### Questions I welcome answers to:
+
+1.  Why does the uncertainty level decrease once I remove the yearly trend? I would have thought this wouldn't make a difference
+2.  How does one allow Prophet to predict a trend more complex than linear or logistic?
+
+### Matters for further exploration:
+
+1.  Confirm for certain the homoscedasticity of the `co2` data, and if not possible, do work to explain it
+2.  Parse the bikes data further back in time, dealing with TFL's inexplicable change of format in September 2022
+3.  Experiment with filtering thresholds or choice of statistic. Should journeys over 3 hours count? Would looking at median journey time or total number of journeys be more interesting?
+4.  Find weather data and compare to bike usage
+5.  Perform similar analysis on the usage levels of other services like Forest or Lime.
+6.  Parse the data and plot a time series which includes the precision of time of day. Then use the same methods to extract a daily trend.
